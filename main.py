@@ -37,7 +37,55 @@ def time_comparison(now, start, end):
     elif now < start:     #超出时间范围，结束
         start_label = False
     return [start_down, start_label]
-    
+
+def parse_time_to_msecs(value: str):
+    value = (value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            return int(time.mktime(dt.timetuple()) * 1000.0)
+        except ValueError:
+            continue
+    return None
+
+def safe_filename(text: str) -> str:
+    # Keep @ for requested naming style; remove only invalid path chars.
+    return re.sub(r'[\\/:*?"<>|\r\n]+', '_', str(text)).strip()
+
+def tweet_id_from_url(url: str):
+    matched = re.search(r'status/(\d+)', url or "")
+    return matched.group(1) if matched else ""
+
+def make_dedupe_key(tweet_id: str, media_url: str):
+    media_url = (media_url or "").split("?")[0]
+    return f'{tweet_id}|{media_url}'
+
+def load_state(path: str):
+    default_state = {
+        "last_cursor": "",
+        "last_seen_tweet_id": "",
+        "last_run_time": "",
+        "manual_start_time": ""
+    }
+    if not os.path.exists(path):
+        return default_state
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return default_state
+            default_state.update(data)
+    except Exception:
+        return default_state
+    return default_state
+
+def save_state(path: str, state: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
 
 #读取配置
 log_output = False
@@ -53,6 +101,18 @@ autoSync = False
 md_file = None
 md_output = True
 media_count_limit = 0
+state_path = os.path.join(os.getcwd(), "state")
+overlap_pages = 3
+manual_start_time_setting = ""
+manual_start_stamp = None
+
+likes_state = {}
+likes_state_file = ""
+likes_seen_marker = False
+likes_first_seen_tweet_id = ""
+likes_page_count = 0
+likes_stop_after_page = False
+run_failed = False
 
 start_time_stamp = 655028357000   #1990-10-04
 end_time_stamp = 2548484357000    #2050-10-04
@@ -110,6 +170,12 @@ with open('settings.json', 'r', encoding='utf8') as f:
 
     if settings['media_count_limit']:
         media_count_limit = settings['media_count_limit']
+    if settings.get('state_path'):
+        state_path = settings['state_path']
+    if settings.get('overlap_pages') is not None:
+        overlap_pages = max(1, int(settings.get('overlap_pages', 3)))
+    manual_start_time_setting = settings.get('manual_start_time', "").strip()
+    manual_start_stamp = parse_time_to_msecs(manual_start_time_setting)
 
     f.close()
 
@@ -119,7 +185,7 @@ _headers = {
     'user-agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
     'authorization':'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
 }
-_headers['cookie'] = settings['cookie']
+_headers['cookie'] = os.getenv('TW_COOKIE', '').strip() or settings.get('cookie', '')
 
 request_count = 0    #请求次数计数
 down_count = 0      #下载图片数计数
@@ -157,6 +223,9 @@ def print_info(_user_info):
     )
 
 def get_download_url(_user_info):
+    global likes_seen_marker, likes_first_seen_tweet_id, likes_page_count, likes_stop_after_page, run_failed
+    if has_likes:
+        likes_page_count += 1
 
     def get_heighest_video_quality(variants) -> str:   #找到最高质量的视频地址,并返回
 
@@ -174,7 +243,7 @@ def get_download_url(_user_info):
 
 
     def get_url_from_content(content):
-        global start_label
+        global start_label, likes_seen_marker, likes_first_seen_tweet_id
         _photo_lst = []
         if has_retweet or has_highlights:
             x_label = 'content'
@@ -186,19 +255,31 @@ def get_download_url(_user_info):
                     continue
                 if 'tweet' in i['entryId']:     #正常推文
                     if 'tweet' in i[x_label]['itemContent']['tweet_results']['result']:
-                        a = i[x_label]['itemContent']['tweet_results']['result']['tweet']['legacy']       #适配限制回复账号
+                        tweet_result = i[x_label]['itemContent']['tweet_results']['result']['tweet']
+                        a = tweet_result['legacy']       #适配限制回复账号
                         frr = [a['favorite_count'], a['retweet_count'], a['reply_count']]
-                        tweet_msecs = int(i[x_label]['itemContent']['tweet_results']['result']['tweet']['edit_control']['editable_until_msecs']) - 3600000
+                        tweet_msecs = int(tweet_result['edit_control']['editable_until_msecs']) - 3600000
+                        tweet_id = tweet_result.get('rest_id') or a.get('id_str', '')
                     else:
-                        a = i[x_label]['itemContent']['tweet_results']['result']['legacy']
+                        tweet_result = i[x_label]['itemContent']['tweet_results']['result']
+                        a = tweet_result['legacy']
                         frr = [a['favorite_count'], a['retweet_count'], a['reply_count']]
-                        tweet_msecs = int(i[x_label]['itemContent']['tweet_results']['result']['edit_control']['editable_until_msecs']) - 3600000
+                        tweet_msecs = int(tweet_result['edit_control']['editable_until_msecs']) - 3600000
+                        tweet_id = tweet_result.get('rest_id') or a.get('id_str', '')
                     timestr = stamp2time(tweet_msecs)
+
+                    if has_likes:
+                        if not likes_first_seen_tweet_id and tweet_id:
+                            likes_first_seen_tweet_id = tweet_id
+                        if likes_state.get("last_seen_tweet_id") and tweet_id == likes_state.get("last_seen_tweet_id"):
+                            likes_seen_marker = True
 
                     #我知道这边代码很烂
                     #但我实在不想重构 ( º﹃º )
 
                     _result = time_comparison(tweet_msecs, start_time_stamp, end_time_stamp)
+                    if has_likes and manual_start_stamp and tweet_msecs < manual_start_stamp:
+                        _result = [False, False]
                     if _result[0]:  #符合时间限制
                         if 'retweeted_status_result' not in a : #判断是否为转推,以及是否获取转推
                             name = _user_info.name
@@ -208,7 +289,7 @@ def get_download_url(_user_info):
                                 name = a2['name']
                                 screen_name = a2['screen_name']
                             if 'extended_entities' in a:
-                                _photo_lst += [(get_heighest_video_quality(_media['video_info']['variants']), f'{timestr}-vid', [tweet_msecs, name, f'@{screen_name}', _media['expanded_url'], 'Video', get_heighest_video_quality(_media['video_info']['variants']), '', a['full_text']] + frr) if 'video_info' in _media and has_video else (_media['media_url_https'], f'{timestr}-img', [tweet_msecs, name, f'@{screen_name}', _media['expanded_url'], 'Image', _media['media_url_https'], '', a['full_text']] + frr) for _media in a['extended_entities']['media']]
+                                _photo_lst += [(get_heighest_video_quality(_media['video_info']['variants']), f'{timestr}-vid', [tweet_msecs, name, f'@{screen_name}', _media['expanded_url'], 'Video', get_heighest_video_quality(_media['video_info']['variants']), '', a['full_text']] + frr, make_dedupe_key(tweet_id or tweet_id_from_url(_media['expanded_url']), get_heighest_video_quality(_media['video_info']['variants']))) if 'video_info' in _media and has_video else (_media['media_url_https'], f'{timestr}-img', [tweet_msecs, name, f'@{screen_name}', _media['expanded_url'], 'Image', _media['media_url_https'], '', a['full_text']] + frr, make_dedupe_key(tweet_id or tweet_id_from_url(_media['expanded_url']), _media['media_url_https'])) for _media in a['extended_entities']['media']]
 
                         elif has_retweet:
                             name = a['retweeted_status_result']['result']['core']['user_results']['result']['legacy']['name']
@@ -217,7 +298,7 @@ def get_download_url(_user_info):
                             id_str = a['retweeted_status_result']['result']['legacy']['id_str']
                             
                             if 'extended_entities' in a['retweeted_status_result']['result']['legacy'] and screen_name != _user_info.screen_name:
-                                _photo_lst += [(get_heighest_video_quality(_media['video_info']['variants']), f'{timestr}-vid-retweet', [tweet_msecs, name, f"@{screen_name}", _media['expanded_url'], 'Video', get_heighest_video_quality(_media['video_info']['variants']), '', full_text] + frr) if 'video_info' in _media and has_video else (_media['media_url_https'], f'{timestr}-img-retweet', [tweet_msecs, name, f"@{screen_name}", _media['expanded_url'], 'Image', _media['media_url_https'], '', full_text] + frr) for _media in a['retweeted_status_result']['result']['legacy']['extended_entities']['media']]
+                                _photo_lst += [(get_heighest_video_quality(_media['video_info']['variants']), f'{timestr}-vid-retweet', [tweet_msecs, name, f"@{screen_name}", _media['expanded_url'], 'Video', get_heighest_video_quality(_media['video_info']['variants']), '', full_text] + frr, make_dedupe_key(id_str, get_heighest_video_quality(_media['video_info']['variants']))) if 'video_info' in _media and has_video else (_media['media_url_https'], f'{timestr}-img-retweet', [tweet_msecs, name, f"@{screen_name}", _media['expanded_url'], 'Image', _media['media_url_https'], '', full_text] + frr, make_dedupe_key(id_str, _media['media_url_https'])) for _media in a['retweeted_status_result']['result']['legacy']['extended_entities']['media']]
 
                     elif not _result[1]:    #已超出目标时间范围
                         start_label = False
@@ -225,19 +306,25 @@ def get_download_url(_user_info):
                 
                 elif 'profile-conversation' in i['entryId']:    #回复的推文(对话线索)
                     if 'tweet' in i[x_label]['items'][0]['item']['itemContent']['tweet_results']['result']:
-                        a = i[x_label]['items'][0]['item']['itemContent']['tweet_results']['result']['tweet']['legacy']
+                        tweet_result = i[x_label]['items'][0]['item']['itemContent']['tweet_results']['result']['tweet']
+                        a = tweet_result['legacy']
                         frr = [a['favorite_count'], a['retweet_count'], a['reply_count']]
-                        tweet_msecs = int(i[x_label]['items'][0]['item']['itemContent']['tweet_results']['result']['tweet']['edit_control']['editable_until_msecs']) - 3600000
+                        tweet_msecs = int(tweet_result['edit_control']['editable_until_msecs']) - 3600000
+                        tweet_id = tweet_result.get('rest_id') or a.get('id_str', '')
                     else:
-                        a = i[x_label]['items'][0]['item']['itemContent']['tweet_results']['result']['legacy']
+                        tweet_result = i[x_label]['items'][0]['item']['itemContent']['tweet_results']['result']
+                        a = tweet_result['legacy']
                         frr = [a['favorite_count'], a['retweet_count'], a['reply_count']]
-                        tweet_msecs = int(i[x_label]['items'][0]['item']['itemContent']['tweet_results']['result']['edit_control']['editable_until_msecs']) - 3600000
+                        tweet_msecs = int(tweet_result['edit_control']['editable_until_msecs']) - 3600000
+                        tweet_id = tweet_result.get('rest_id') or a.get('id_str', '')
                     timestr = stamp2time(tweet_msecs)
 
                     _result = time_comparison(tweet_msecs, start_time_stamp, end_time_stamp)
+                    if has_likes and manual_start_stamp and tweet_msecs < manual_start_stamp:
+                        _result = [False, False]
                     if _result[0]:  #符合时间限制
                         if 'extended_entities' in a:
-                            _photo_lst += [(get_heighest_video_quality(_media['video_info']['variants']), f'{timestr}-vid', [tweet_msecs, _user_info.name, f'@{_user_info.screen_name}', _media['expanded_url'], 'Video', get_heighest_video_quality(_media['video_info']['variants']), '', a['full_text']] + frr) if 'video_info' in _media and has_video else (_media['media_url_https'], f'{timestr}-img', [tweet_msecs, _user_info.name, f'@{_user_info.screen_name}', _media['expanded_url'], 'Image', _media['media_url_https'], '', a['full_text']] + frr) for _media in a['extended_entities']['media']]
+                            _photo_lst += [(get_heighest_video_quality(_media['video_info']['variants']), f'{timestr}-vid', [tweet_msecs, _user_info.name, f'@{_user_info.screen_name}', _media['expanded_url'], 'Video', get_heighest_video_quality(_media['video_info']['variants']), '', a['full_text']] + frr, make_dedupe_key(tweet_id or tweet_id_from_url(_media['expanded_url']), get_heighest_video_quality(_media['video_info']['variants']))) if 'video_info' in _media and has_video else (_media['media_url_https'], f'{timestr}-img', [tweet_msecs, _user_info.name, f'@{_user_info.screen_name}', _media['expanded_url'], 'Image', _media['media_url_https'], '', a['full_text']] + frr, make_dedupe_key(tweet_id or tweet_id_from_url(_media['expanded_url']), _media['media_url_https'])) for _media in a['extended_entities']['media']]
                     elif not _result[1]:    #已超出目标时间范围
                         start_label = False
                         break
@@ -274,6 +361,7 @@ def get_download_url(_user_info):
         try:
             raw_data = json.loads(response)
         except Exception:
+            run_failed = True
             if 'Rate limit exceeded' in response:
                 print('API次数已超限')
             else:
@@ -309,10 +397,17 @@ def get_download_url(_user_info):
             photo_lst = get_url_from_content(raw_data)
         else:
             return False
+
+        if has_likes and likes_page_count >= overlap_pages:
+            if likes_seen_marker:
+                likes_stop_after_page = True
+            if likes_state.get("last_cursor") and _user_info.cursor == likes_state.get("last_cursor"):
+                likes_stop_after_page = True
         
         if not photo_lst:
             photo_lst.append(True)
     except Exception as e:
+        run_failed = True
         print('获取推文信息错误')
         print(e)
         print(response)
@@ -322,22 +417,31 @@ def get_download_url(_user_info):
 def download_control(_user_info):
     async def _main():
         async def down_save(url, prefix, csv_info, order: int):
+            global run_failed
+            tweet_time = csv_info[0] if isinstance(csv_info[0], str) else stamp2time(csv_info[0])
+            download_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            file_root = safe_filename(f'{csv_info[2]}_{tweet_time.replace(" ", "_")}_{download_time}')
             if '.mp4' in url:
-                _file_name = f'{_user_info.save_path + os.sep}{prefix}_{_user_info.count + order}.mp4'
+                _file_name = f'{_user_info.save_path + os.sep}{file_root}.mp4'
             else:
                 try:
                     if orig_format:
                         url += f'?name=orig'
-                        _file_name = f'{_user_info.save_path + os.sep}{prefix}_{_user_info.count + order}.{csv_info[5][-3:]}' # 根据图片 url 获取原始格式
+                        _file_name = f'{_user_info.save_path + os.sep}{file_root}.{csv_info[5][-3:]}' # 根据图片 url 获取原始格式
                     else: # 指定格式时，先使用 name=orig，404 则切回 name=4096x4096，以保证最大尺寸
-                        _file_name = f'{_user_info.save_path + os.sep}{prefix}_{_user_info.count + order}.{img_format}'
+                        _file_name = f'{_user_info.save_path + os.sep}{file_root}.{img_format}'
                         if img_format != 'png':
                             url += f'?format=jpg&name=4096x4096'
                         else:
                             url += f'?format=png&name=4096x4096'
                 except Exception as e:
                     print(url)
+                    run_failed = True
                     return False
+
+            if os.path.exists(_file_name):
+                stem, ext = os.path.splitext(_file_name)
+                _file_name = f'{stem}_{order}{ext}'
 
             csv_info[-5] = os.path.split(_file_name)[1]
             if md_output: # 在下载完毕之前先输出到 Markdown，以尽可能保证高并发下载也能得到正确的推文顺序。
@@ -365,6 +469,7 @@ def download_control(_user_info):
                     if '.mp4' in url or orig_format or str(e) != "404":
                         count += 1
                         if count >= 50:
+                            run_failed = True
                             print(f'{_file_name}=====>第{count}次下载失败，已跳过该文件。')
                             print(url)
                             break
@@ -381,18 +486,37 @@ def download_control(_user_info):
                 continue
             semaphore = asyncio.Semaphore(max_concurrent_requests)    #最大并发数量，默认为8，对自己网络有自信的可以调高
             if down_log:
-                await asyncio.gather(*[asyncio.create_task(down_save(url[0], url[1], url[2], order)) for order,url in enumerate(photo_lst) if cache_data.is_present(url[0])])
+                await asyncio.gather(*[asyncio.create_task(down_save(url[0], url[1], url[2], order)) for order,url in enumerate(photo_lst) if cache_data.is_present(url[3])])
             else:
                 await asyncio.gather(*[asyncio.create_task(down_save(url[0], url[1], url[2], order)) for order,url in enumerate(photo_lst)])
             _user_info.count += len(photo_lst)      #更新计数
+            if has_likes and likes_stop_after_page:
+                break
 
     asyncio.run(_main())
 
 def main(_user_info: object):
+    global likes_state, likes_state_file, likes_seen_marker, likes_first_seen_tweet_id, likes_page_count, likes_stop_after_page, manual_start_stamp, run_failed
+    likes_seen_marker = False
+    likes_first_seen_tweet_id = ""
+    likes_page_count = 0
+    likes_stop_after_page = False
+    likes_state_file = os.path.join(state_path, f'{_user_info.screen_name}.state.json')
+    likes_state = load_state(likes_state_file)
+    if manual_start_time_setting:
+        likes_state["manual_start_time"] = manual_start_time_setting
+    manual_start_stamp = parse_time_to_msecs(likes_state.get("manual_start_time", ""))
+
     re_token = 'ct0=(.*?);'
-    _headers['x-csrf-token'] = re.findall(re_token,_headers['cookie'])[0]
+    token_match = re.findall(re_token, _headers['cookie'])
+    if not token_match:
+        print('cookie 缺少 ct0，请检查 settings.json 或 TW_COOKIE 环境变量')
+        run_failed = True
+        return False
+    _headers['x-csrf-token'] = token_match[0]
     _headers['referer'] = 'https://twitter.com/' + _user_info.screen_name
     if not get_other_info(_user_info):
+        run_failed = True
         return False
     print_info(_user_info)
     _path = settings['save_path'] + _user_info.screen_name
@@ -432,6 +556,12 @@ def main(_user_info: object):
 
     download_control(_user_info)
 
+    if has_likes:
+        likes_state["last_cursor"] = _user_info.cursor or likes_state.get("last_cursor", "")
+        likes_state["last_seen_tweet_id"] = likes_first_seen_tweet_id or likes_state.get("last_seen_tweet_id", "")
+        likes_state["last_run_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_state(likes_state_file, likes_state)
+
     csv_file.csv_close()
     
     if md_output:
@@ -443,8 +573,13 @@ def main(_user_info: object):
 
 if __name__=='__main__':
     _start = time.time()
+    if not _headers['cookie']:
+        print('未找到可用 cookie，请先配置 settings.json 或 TW_COOKIE 环境变量')
+        sys.exit(1)
     for i in settings['user_lst'].split(','):
         main(User_info(i))
         start_label = True
         First_Page = True
     print(f'共耗时:{time.time()-_start}秒\n共调用{request_count}次API\n共下载{down_count}份图片/视频')
+    if run_failed:
+        sys.exit(1)

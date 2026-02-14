@@ -8,7 +8,9 @@ class cache_gen():
 
         if os.path.exists(self.cache_path):
             with open(self.cache_path, 'rb') as f:
-                self.cache_data = pickle.load(f)
+                data = pickle.load(f)
+                # Backward compatible: old cache may not be a set
+                self.cache_data = data if isinstance(data, set) else set(data)
         else:
             self.cache_data = set()
 
@@ -20,6 +22,7 @@ class cache_gen():
         self.cache_data.add(element)
 
     def is_present(self, element):
+        element = str(element)
         if element in self.cache_data:
             return False
         else:

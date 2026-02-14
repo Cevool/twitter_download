@@ -1,0 +1,11 @@
+services:
+  twitter_download:
+    build: .
+    container_name: twitter_download
+    env_file:
+      - .env
+    volumes:
+      - ./download:/app/download
+      - ./state:/app/state
+      - ./settings.json:/app/settings.json
+    command: ["python", "main.py"]

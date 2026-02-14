@@ -93,6 +93,53 @@ python3 main.py
 ``` 
 **Windows** 和上面的一样，配置完setting.json后运行main.py即可 
 
+增量抓取（Likes）& NAS 自动化
+---
+
+- `likes=true` 时支持状态文件增量同步（默认状态目录 `./state`）
+- 采用 `last_seen_tweet_id + overlap_pages` 回扫防漏抓，并对媒体使用持久化去重键（`tweet_id|media_url`）
+- 手动起始时间可通过 `state_ctl.py` 管理（优先于默认增量边界）
+- 文件命名格式：`@作者ID_推文发布时间_下载时间.ext`
+- 原图策略：`image_format=orig` 时优先 `name=orig`，失败自动回退
+
+状态控制命令
+```bash
+# 查看状态
+python state_ctl.py show --user ars_0947 --state-dir ./state
+
+# 设置手动起始时间
+python state_ctl.py set-start --user ars_0947 --state-dir ./state --time "2026-02-14 00:00"
+
+# 清空手动起始时间
+python state_ctl.py clear-start --user ars_0947 --state-dir ./state
+```
+
+Cookie 环境变量优先级
+---
+
+- 读取优先级：`TW_COOKIE` 环境变量 > `settings.json` 中 `cookie`
+- 推荐在 NAS 容器中使用 `.env` 注入 `TW_COOKIE`，避免明文写死配置文件
+- 本地 Windows 可用 `cookie_sync.py` 自动刷新 `.env`
+
+```bash
+pip install browser-cookie3
+python cookie_sync.py --env-file ".env"
+```
+
+群晖任务建议
+---
+
+- 本地 Windows 计划任务：每日 `03:40` 执行 `cookie_sync.py`
+- 群晖计划任务：每日 `04:00` 运行容器 `python main.py`
+- 在 DSM 通知中心开启邮件，并为任务启用“失败通知”
+- 任务失败时脚本返回非 0 退出码，便于 DSM 邮件告警触发
+
+Docker 快速运行
+```bash
+docker compose build
+docker compose run --rm twitter_download
+```
+
 
 注意事项
 ---
